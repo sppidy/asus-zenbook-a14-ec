@@ -93,6 +93,7 @@
 #define EC_PROFILE_BYTE_BALANCED	0x01
 #define EC_PROFILE_BYTE_QUIET		0x02
 #define EC_PROFILE_BYTE_PERFORMANCE	0x04
+#define EC_PROFILE_BYTE_MAX_POWER	0x10
 
 /* hwmon-exposed registers (validated during EC investigation) */
 #define EC_REG_FAN_MODE_MAJ	0x01
@@ -631,16 +632,19 @@ static const struct attribute_group asus_ec_profile_group = {
  * by controlling the fan directly:
  *   QUIET        → auto mode (EC manages conservatively)
  *   BALANCED     → auto mode (EC default thermal curve)
- *   PERFORMANCE  → manual mode, PWM 180 (~2400 RPM sustained cooling)
+ *   PERFORMANCE  → WEBC 0x04, fallback manual mode + PWM 180
+ *   MAX_POWER    → WEBC 0x10, fallback manual mode + PWM 69
  */
 
 #define PP_PERF_PWM	180
+#define PP_MAX_POWER_PWM	69
 
 static int asus_ec_pp_probe(void *drvdata, unsigned long *choices)
 {
 	set_bit(PLATFORM_PROFILE_QUIET, choices);
 	set_bit(PLATFORM_PROFILE_BALANCED, choices);
 	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
+	set_bit(PLATFORM_PROFILE_MAX_POWER, choices);
 	return 0;
 }
 
@@ -674,6 +678,8 @@ static int asus_ec_pp_set(struct device *dev,
 			byte = EC_PROFILE_BYTE_BALANCED; break;
 		case PLATFORM_PROFILE_PERFORMANCE:
 			byte = EC_PROFILE_BYTE_PERFORMANCE; break;
+		case PLATFORM_PROFILE_MAX_POWER:
+			byte = EC_PROFILE_BYTE_MAX_POWER; break;
 		default:
 			byte = 0;
 		}
@@ -723,6 +729,19 @@ static int asus_ec_pp_set(struct device *dev,
 			ec->manual_active = true;
 		}
 		ret = asus_ec_set_pwm(ec, PP_PERF_PWM);
+		if (ret)
+			goto out;
+		break;
+
+	case PLATFORM_PROFILE_MAX_POWER:
+		/* Manual mode with maximum PWM for maximum cooling (~6000 RPM). */
+		if (!ec->manual_active) {
+			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+			if (ret)
+				goto out;
+			ec->manual_active = true;
+		}
+		ret = asus_ec_set_pwm(ec, PP_MAX_POWER_PWM);
 		if (ret)
 			goto out;
 		break;
@@ -1236,7 +1255,7 @@ static int asus_ec_probe(struct i2c_client *client)
 			 PTR_ERR(ec->ppdev));
 		ec->ppdev = NULL;
 	} else {
-		dev_info(dev, "platform_profile registered (quiet/balanced/performance)\n");
+		dev_info(dev, "platform_profile registered (quiet/balanced/performance/max-power)\n");
 	}
 
 	return 0;

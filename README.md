@@ -1,8 +1,8 @@
 # asus-zenbook-a14-ec
 
 Out-of-tree Linux kernel drivers for the **ASUS Zenbook A14**.
-Provides fan/temperature sensors, power profiles (quiet/balanced/performance),
-keyboard backlight, and Fn hotkeys.
+Provides fan/temperature sensors, power profiles, keyboard backlight, and Fn
+hotkeys on Linux.
 
 Forked from [Sombre-Osmoze/asus-zenbook-a14-ec](https://github.com/Sombre-Osmoze/asus-zenbook-a14-ec)
 (RA / X1E80100). This fork is tuned for **UX3407QA** (Snapdragon X1P, x1p42100)
@@ -13,7 +13,7 @@ path falls back to the RA fan-mode dressup automatically when WEBC NACKs.
 
 | Variant   | SoC      | Status                                       |
 |-----------|----------|----------------------------------------------|
-| UX3407QA  | X1P      | Tested. WEBC(0x11) profile path works.       |
+| UX3407QA  | X1P      | Tested on QA hardware. WEBC profiles work.   |
 | UX3407RA  | X1E      | Untested in this fork. Should fall back to fan-mode dressup as in upstream. |
 
 ## Modules
@@ -30,11 +30,13 @@ path falls back to the RA fan-mode dressup automatically when WEBC NACKs.
 - **hwmon**: `fan1_input`, `pwm1`, `pwm1_enable`, `temp1_input`
   - `temp2` removed (sub-register `(0x05, 0x01)` returns a constant 103°C on QA;
     not a real second thermistor).
-- **platform_profile**: `quiet` / `balanced` / `performance`
+- **platform_profile**: `quiet` / `balanced` / `performance` / `max-power`
   - QA: WEBC(0x11) accepted by the EC; profile change is a single block-write,
     fan stays in EC AUTO afterwards.
+  - `max-power` uses the firmware profile byte `0x10` on QA.
   - If WEBC NACKs (RA path), driver falls back to fan-mode dressup
-    (quiet/balanced = AUTO, performance = MANUAL + PWM 180).
+    (quiet/balanced = AUTO, performance = MANUAL + PWM 180,
+    max-power = MANUAL + PWM 69).
 - **Manual PWM**: works; A14 has no watchdog.
 - **Suspend/resume**: clean entry/exit on the driver side. Note: deep sleep
   bails after ~2 s on this kernel for unrelated PSCI reasons (use `s2idle`).
@@ -100,6 +102,39 @@ sudo insmod ./asus_zenbook_a14_ec.ko
 sudo insmod ./hid_asus_ec.ko
 ```
 
+For an in-tree kernel package build, enable:
+
+```text
+CONFIG_EC_ASUS_ZENBOOK_A14=m
+CONFIG_HID_ASUS_EC=m
+```
+
+and add the EC node under the Zenbook A14 `&i2c5` device-tree node.
+
+## Validation
+
+After booting the target kernel, the ready state should look like this:
+
+```sh
+uname -r
+lsmod | grep -E 'asus_zenbook_a14_ec|hid_asus_ec|platform_profile'
+cat /sys/class/platform-profile/platform-profile-0/name
+cat /sys/class/platform-profile/platform-profile-0/choices
+cat /sys/class/platform-profile/platform-profile-0/profile
+ls /sys/class/leds | grep 'asus::kbd_backlight'
+sensors | grep -A4 asus_zenbook_a14_ec
+```
+
+Expected profile choices for the validated path:
+
+```text
+quiet balanced performance max-power
+```
+
+First-write testing should be conservative: switch one profile at a time, wait
+for fan/temperature readings to settle, and return to `balanced` before
+continuing.
+
 ## Exposed interfaces
 
 | sysfs                                                  | semantics                          |
@@ -109,7 +144,7 @@ sudo insmod ./hid_asus_ec.ko
 | `hwmon/hwmonN/pwm1_enable`                             | 1 = manual, 2 = auto (RW)          |
 | `hwmon/hwmonN/temp1_input`                             | EC thermistor, m°C                 |
 | `leds/asus::kbd_backlight/brightness`                  | 0–3                                |
-| `class/platform-profile/platform-profile-0/profile`    | quiet / balanced / performance     |
+| `class/platform-profile/platform-profile-0/profile`    | quiet / balanced / performance / max-power |
 
 ## Scripts
 
@@ -133,6 +168,10 @@ The driver enforces:
 A14 has **no fan watchdog** (verified: 3 + min manual mode = no reboot), so
 manual PWM is safe without a temperature-feed loop. **Vivobook S15 and
 similar Snapdragon laptops do** — porting needs a watchdog kthread.
+
+Do not run raw userspace I2C tools against `0x5b` or `0x76` while
+`asus_zenbook_a14_ec` is bound. The kernel driver owns the EC mailbox and fan
+controller; concurrent raw writes can race the driver.
 
 If anything misbehaves: hard power-cycle and pick a working kernel from the
 bootloader.

@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ASUS Zenbook A14 (UX3407RA) Embedded Controller driver — PoC
+ * ASUS Zenbook A14 (UX3407QA / UX3407RA) Embedded Controller driver
  *
- * Step 5: platform_profile (low-power / balanced / performance).
+ * QA fork additions vs the RA upstream:
+ *   - Bound as an i2c_client via DT (compatible "asus,zenbook-a14-ec"),
+ *     not as a synthetic platform device + bus_find_device_by_name().
+ *   - asus_ec_pp_set() tries the QA DSDT WEBC(0x11, 1, [byte]) block-write
+ *     at 0x76 first; on NACK it falls back to the RA fan-mode dressup so
+ *     the same source works on both variants.
+ *
+ * Original RA notes (PoC, step 5: platform_profile):
  *
  *   fan1_input   eccr(0x01, 0x09) × 88        RPM (calibrated)
  *   fan1_label   "fan"
@@ -45,8 +52,8 @@
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/mod_devicetable.h>
 #include <linux/of.h>
-#include <linux/platform_device.h>
 #include <linux/platform_profile.h>
 #include <linux/pm.h>
 #include <linux/sched.h>
@@ -54,7 +61,6 @@
 
 #define DRV_NAME		"asus_zenbook_a14_ec"
 
-#define EC_I2C_BUS_NAME		"b94000.i2c"
 #define EC_I2C_ADDR		0x5b
 #define FAN_I2C_ADDR		0x76
 
@@ -69,6 +75,24 @@
 
 #define EC_SETTLE_INTERVAL_US	50000
 #define EC_SETTLE_TIMEOUT_MS	2000
+
+/* QA-only: WEBC block-write window at major 0xc9 (DSDT WEBC method).
+ * Payload bytes go to 0x40..0x6e, then BMCR(0x6f) is set to 0x80 to kick.
+ */
+#define EC_BLK_MAJ		0xc9
+#define EC_BLK_DATA0		0x40
+#define EC_BLK_CMD		0x6e
+#define EC_BLK_BMCR		0x6f
+#define EC_BLK_BMCR_KICK	0x80
+#define EC_BLK_BMCR_BUSY	0x40
+#define EC_BLK_PRE_KICK_TRIES	200
+#define EC_BLK_PRE_KICK_INTERVAL_US 100
+#define WEBC_CMD_PROFILE	0x11
+
+/* QA-only: WEBC profile bytes (matches the DSDT _WEBC payload). */
+#define EC_PROFILE_BYTE_BALANCED	0x01
+#define EC_PROFILE_BYTE_QUIET		0x02
+#define EC_PROFILE_BYTE_PERFORMANCE	0x04
 
 /* hwmon-exposed registers (validated during EC investigation) */
 #define EC_REG_FAN_MODE_MAJ	0x01
@@ -149,6 +173,12 @@ struct asus_ec {
 	u8			profile_cached;	/* last value we wrote */
 	struct device		*ppdev;		/* platform_profile class device */
 	enum platform_profile_option pp_active;	/* currently active profile */
+
+	/* QA-only: WEBC profile path. proven_bad sticks after first NACK so
+	 * we don't keep retrying on RA where the EC will never accept it.
+	 */
+	bool			webc_profile_works;
+	bool			webc_profile_proven_bad;
 
 	/* DMA-safe scratch (kmalloc-backed via devm_kzalloc) */
 	u8			tx[3];
@@ -330,6 +360,57 @@ static int asus_ec_write_reg(struct asus_ec *ec, u8 maj, u8 min, u8 val)
 
 	mutex_lock(&ec->lock);
 	ret = __ec_cw(ec, maj, min, val);
+	mutex_unlock(&ec->lock);
+	return ret;
+}
+
+/*
+ * QA DSDT WEBC block-write. Payload goes to 0xc9:0x40..; BMCR(0x6f) is set
+ * to 0x80 to kick; the command byte goes to 0x6e last. Fire-and-forget —
+ * we drop the lock immediately after the kick rather than polling BMCR
+ * (the post-kick wait deadlocked an earlier attempt). Returns 0 on
+ * success, -EBUSY if the pre-kick busy poll never cleared, or any errno
+ * from the underlying register writes.
+ */
+static int asus_ec_webc(struct asus_ec *ec, u8 cmd, const u8 *buf, size_t len)
+{
+	u8 bmcr = 0;
+	int ret, i;
+
+	if (len > (EC_BLK_BMCR - EC_BLK_DATA0))
+		return -EINVAL;
+
+	mutex_lock(&ec->lock);
+
+	for (i = 0; i < EC_BLK_PRE_KICK_TRIES; i++) {
+		ret = __ec_rb(ec, EC_BLK_MAJ, EC_BLK_BMCR, &bmcr);
+		if (ret)
+			goto out;
+		if (bmcr == 0)
+			break;
+		usleep_range(EC_BLK_PRE_KICK_INTERVAL_US,
+			     EC_BLK_PRE_KICK_INTERVAL_US + 50);
+	}
+	if (bmcr != 0) {
+		(void)__ec_wb(ec, EC_BLK_MAJ, EC_BLK_BMCR,
+			      bmcr | EC_BLK_BMCR_BUSY);
+		ret = -EBUSY;
+		goto out;
+	}
+
+	for (i = 0; i < (int)len; i++) {
+		ret = __ec_wb(ec, EC_BLK_MAJ, EC_BLK_DATA0 + i, buf[i]);
+		if (ret)
+			goto out;
+	}
+
+	ret = __ec_wb(ec, EC_BLK_MAJ, EC_BLK_BMCR, bmcr | EC_BLK_BMCR_KICK);
+	if (ret)
+		goto out;
+
+	ret = __ec_wb(ec, EC_BLK_MAJ, EC_BLK_CMD, cmd);
+
+out:
 	mutex_unlock(&ec->lock);
 	return ret;
 }
@@ -577,6 +658,47 @@ static int asus_ec_pp_set(struct device *dev,
 {
 	struct asus_ec *ec = dev_get_drvdata(dev);
 	int ret;
+	u8 byte;
+
+	/*
+	 * QA path: try the DSDT WEBC(0x11, 1, [byte]) block-write first.
+	 * On QA the EC accepts it and applies the OEM thermal table; on RA
+	 * it NACKs and proven_bad sticks, so subsequent calls drop straight
+	 * into the fan-mode dressup below.
+	 */
+	if (!ec->webc_profile_proven_bad) {
+		switch (profile) {
+		case PLATFORM_PROFILE_QUIET:
+			byte = EC_PROFILE_BYTE_QUIET; break;
+		case PLATFORM_PROFILE_BALANCED:
+			byte = EC_PROFILE_BYTE_BALANCED; break;
+		case PLATFORM_PROFILE_PERFORMANCE:
+			byte = EC_PROFILE_BYTE_PERFORMANCE; break;
+		default:
+			byte = 0;
+		}
+		if (byte) {
+			ret = asus_ec_webc(ec, WEBC_CMD_PROFILE, &byte, 1);
+			if (!ret) {
+				ec->webc_profile_works = true;
+				/* If we'd put the EC in manual mode for an
+				 * earlier performance profile, hand control
+				 * back so the OEM curve can apply. */
+				mutex_lock(&ec->mode_lock);
+				if (ec->manual_active) {
+					if (!asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO))
+						ec->manual_active = false;
+				}
+				ec->pp_active = profile;
+				mutex_unlock(&ec->mode_lock);
+				return 0;
+			}
+			dev_warn(ec->dev,
+				 "WEBC profile path NACK'd (%d); falling back to fan dressup\n",
+				 ret);
+			ec->webc_profile_proven_bad = true;
+		}
+	}
 
 	mutex_lock(&ec->mode_lock);
 
@@ -1003,56 +1125,13 @@ static const struct hwmon_chip_info asus_ec_hwmon_chip_info = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Adapter discovery                                                  */
-/* ------------------------------------------------------------------ */
-
-static struct i2c_adapter *asus_ec_find_adapter(struct device *dev)
-{
-	struct device *plat_dev;
-	struct device_node *np;
-	struct i2c_adapter *adap;
-
-	plat_dev = bus_find_device_by_name(&platform_bus_type, NULL,
-					   EC_I2C_BUS_NAME);
-	if (!plat_dev) {
-		dev_err(dev, "platform device '%s' not found\n",
-			EC_I2C_BUS_NAME);
-		return NULL;
-	}
-
-	np = plat_dev->of_node;
-	if (!np) {
-		dev_err(dev, "'%s' has no OF node\n", EC_I2C_BUS_NAME);
-		put_device(plat_dev);
-		return NULL;
-	}
-
-	adap = of_find_i2c_adapter_by_node(np);
-	put_device(plat_dev);
-
-	if (!adap) {
-		dev_dbg(dev, "i2c adapter for '%s' not yet registered\n",
-			EC_I2C_BUS_NAME);
-		return NULL;
-	}
-
-	return adap;
-}
-
-/* ------------------------------------------------------------------ */
 /* probe / remove                                                     */
 /* ------------------------------------------------------------------ */
 
-static int asus_ec_probe(struct platform_device *pdev)
+static int asus_ec_probe(struct i2c_client *client)
 {
-	struct device *dev = &pdev->dev;
+	struct device *dev = &client->dev;
 	struct asus_ec *ec;
-	struct i2c_board_info ec_info = {
-		I2C_BOARD_INFO("asus_zenbook_a14_ec", EC_I2C_ADDR),
-	};
-	struct i2c_board_info fan_info = {
-		I2C_BOARD_INFO("asus_zenbook_a14_fan", FAN_I2C_ADDR),
-	};
 	u8 tach, pwm, temp, mode;
 	int ret;
 
@@ -1064,28 +1143,22 @@ static int asus_ec_probe(struct platform_device *pdev)
 	mutex_init(&ec->lock);
 	mutex_init(&ec->mode_lock);
 
-	ec->adapter = asus_ec_find_adapter(dev);
-	if (!ec->adapter)
-		return -EPROBE_DEFER;
+	/* We are the i2c_client at 0x5b — adapter comes from there. */
+	ec->adapter = client->adapter;
+	ec->ec_client = client;
 
-	ec->ec_client = i2c_new_client_device(ec->adapter, &ec_info);
-	if (IS_ERR(ec->ec_client)) {
-		dev_err(dev, "failed to register EC client at 0x%02x\n",
-			EC_I2C_ADDR);
-		i2c_put_adapter(ec->adapter);
-		return PTR_ERR(ec->ec_client);
-	}
-
-	ec->fan_client = i2c_new_client_device(ec->adapter, &fan_info);
+	/* Companion fan controller at 0x76 on the same bus is not in DT;
+	 * claim it as a dummy so userspace can't open it concurrently. */
+	ec->fan_client = devm_i2c_new_dummy_device(dev, ec->adapter,
+						   FAN_I2C_ADDR);
 	if (IS_ERR(ec->fan_client)) {
-		dev_err(dev, "failed to register FAN client at 0x%02x\n",
+		dev_err(dev, "failed to claim fan controller at 0x%02x\n",
 			FAN_I2C_ADDR);
-		i2c_unregister_device(ec->ec_client);
-		i2c_put_adapter(ec->adapter);
 		return PTR_ERR(ec->fan_client);
 	}
 
-	platform_set_drvdata(pdev, ec);
+	i2c_set_clientdata(client, ec);
+	dev_set_drvdata(dev, ec);
 
 	asus_ec_lookup_thermal_zones(ec);
 
@@ -1113,9 +1186,6 @@ static int asus_ec_probe(struct platform_device *pdev)
 	if (IS_ERR(ec->hwmon_dev)) {
 		ret = PTR_ERR(ec->hwmon_dev);
 		dev_err(dev, "hwmon registration failed: %d\n", ret);
-		i2c_unregister_device(ec->fan_client);
-		i2c_unregister_device(ec->ec_client);
-		i2c_put_adapter(ec->adapter);
 		return ret;
 	}
 
@@ -1172,9 +1242,9 @@ static int asus_ec_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void asus_ec_remove(struct platform_device *pdev)
+static void asus_ec_remove(struct i2c_client *client)
 {
-	struct asus_ec *ec = platform_get_drvdata(pdev);
+	struct asus_ec *ec = i2c_get_clientdata(client);
 
 	if (!ec)
 		return;
@@ -1187,16 +1257,9 @@ static void asus_ec_remove(struct platform_device *pdev)
 		asus_ec_stop_watchdog(ec);
 	mutex_unlock(&ec->mode_lock);
 
-	/* hwmon_dev is devm-managed and torn down automatically. */
+	/* hwmon_dev and fan_client are devm-managed. */
 
-	if (!IS_ERR_OR_NULL(ec->fan_client))
-		i2c_unregister_device(ec->fan_client);
-	if (!IS_ERR_OR_NULL(ec->ec_client))
-		i2c_unregister_device(ec->ec_client);
-	if (ec->adapter)
-		i2c_put_adapter(ec->adapter);
-
-	dev_info(&pdev->dev, "removed\n");
+	dev_info(&client->dev, "removed\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1259,48 +1322,31 @@ static int __maybe_unused asus_ec_resume(struct device *dev)
 
 static SIMPLE_DEV_PM_OPS(asus_ec_pm_ops, asus_ec_suspend, asus_ec_resume);
 
-static struct platform_driver asus_ec_driver = {
-	.driver	= {
-		.name	= DRV_NAME,
-		.pm	= &asus_ec_pm_ops,
-	},
-	.probe	= asus_ec_probe,
-	.remove	= asus_ec_remove,
+static const struct of_device_id asus_ec_of_match[] = {
+	{ .compatible = "asus,zenbook-a14-ec" },
+	{ }
 };
+MODULE_DEVICE_TABLE(of, asus_ec_of_match);
 
-/*
- * No DT match for now — we register a virtual platform device manually
- * at module init so the driver binds without any DT changes.
- */
-static struct platform_device *asus_ec_pdev;
+static const struct i2c_device_id asus_ec_i2c_id[] = {
+	{ DRV_NAME, 0 },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, asus_ec_i2c_id);
 
-static int __init asus_ec_init(void)
-{
-	int ret;
-
-	ret = platform_driver_register(&asus_ec_driver);
-	if (ret)
-		return ret;
-
-	asus_ec_pdev = platform_device_register_simple(DRV_NAME, -1, NULL, 0);
-	if (IS_ERR(asus_ec_pdev)) {
-		platform_driver_unregister(&asus_ec_driver);
-		return PTR_ERR(asus_ec_pdev);
-	}
-
-	return 0;
-}
-
-static void __exit asus_ec_exit(void)
-{
-	platform_device_unregister(asus_ec_pdev);
-	platform_driver_unregister(&asus_ec_driver);
-}
-
-module_init(asus_ec_init);
-module_exit(asus_ec_exit);
+static struct i2c_driver asus_ec_driver = {
+	.driver	= {
+		.name		= DRV_NAME,
+		.of_match_table	= asus_ec_of_match,
+		.pm		= &asus_ec_pm_ops,
+	},
+	.probe		= asus_ec_probe,
+	.remove		= asus_ec_remove,
+	.id_table	= asus_ec_i2c_id,
+};
+module_i2c_driver(asus_ec_driver);
 
 MODULE_AUTHOR("Sombre-Osmoze <sombre@osmoze.xyz>");
-MODULE_DESCRIPTION("ASUS Zenbook A14 (UX3407RA) Embedded Controller driver (PoC)");
+MODULE_AUTHOR("Ramshouriesh <rshouriesh@gmail.com>");
+MODULE_DESCRIPTION("ASUS Zenbook A14 (UX3407QA / UX3407RA) Embedded Controller driver");
 MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:" DRV_NAME);

@@ -118,65 +118,13 @@ static int asus_raw_event(struct hid_device *hdev, struct hid_report *report,
 
 		/* FN + F1, F2 and F3 are not managed by EC*/
 
-		case A14_EC_EVT_KEY_FN_F4:
-			if (size >= 3) {
-				u8 current_level = data->saved_brightness;
-				u8 max_level = A14_EC_MAX_BACKLIGHT;
-				u8 next_level = (current_level + 1) % (max_level + 1);
-
-				asus_kbd_set_brightness(&data->kbd_led_cdev,
-							(enum led_brightness)next_level);
-				if (next_level > current_level ||
-				    (current_level == max_level && next_level == 0)) {
-					if (next_level == 0) {
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 1);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 0);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 1);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 0);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 1);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMDOWN, 0);
-						input_sync(input_dev);
-					} else {
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMUP, 1);
-						input_sync(input_dev);
-						input_event(input_dev, EV_KEY,
-							    KEY_KBDILLUMUP, 0);
-						input_sync(input_dev);
-					}
-				} else if (next_level < current_level) {
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 1);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 0);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 1);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 0);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 1);
-					input_sync(input_dev);
-					input_event(input_dev, EV_KEY,
-						    KEY_KBDILLUMDOWN, 0);
-					input_sync(input_dev);
-				}
-			}
+		case A14_EC_EVT_KEY_FN_F4: {
+			u8 next_level = (data->saved_brightness + 1) %
+					(A14_EC_MAX_BACKLIGHT + 1);
+			asus_kbd_set_brightness(&data->kbd_led_cdev,
+						(enum led_brightness)next_level);
 			return 1;
+		}
 		case A14_EC_EVT_KEY_FN_F5:
 			input_event(input_dev, EV_KEY, KEY_BRIGHTNESSDOWN, 1);
 			input_sync(input_dev);
@@ -293,7 +241,7 @@ static int asus_hid_resume(struct hid_device *hdev)
 
 static const struct hid_device_id asus_hid_devices[] = {
 	/* Tested on ASUS Zenbook A14 (UX3407QA) only. */
-	{ HID_DEVICE(0x18, 0x00, ASUS_VENDOR_ID, ASUS_PRODUCT_ID) },
+	{ HID_DEVICE(BUS_I2C, 0x00, ASUS_VENDOR_ID, ASUS_PRODUCT_ID) },
 	{ } /* Terminating entry */
 };
 MODULE_DEVICE_TABLE(hid, asus_hid_devices);
